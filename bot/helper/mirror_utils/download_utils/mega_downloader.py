@@ -8,13 +8,12 @@ from bot.helper.mirror_utils.status_utils.mega_download_status import MegaDownlo
 import random
 import string
 
-
 class MegaDownloaderException(Exception):
     pass
 
 
 class MegaAppListener(MegaListener):
-    _NO_EVENT_ON = (MegaRequest.TYPE_LOGIN, MegaRequest.TYPE_FETCH_NODES)
+    _NO_EVENT_ON = (MegaRequest.TYPE_LOGIN,MegaRequest.TYPE_FETCH_NODES)
     NO_ERROR = "no error"
 
     def __init__(self, continue_event: threading.Event, listener):
@@ -62,7 +61,9 @@ class MegaAppListener(MegaListener):
     def onRequestFinish(self, api, request, error):
         LOGGER.info('Mega Request finished ({}); Result: {}'
                     .format(request, error))
-
+        if str(error).lower() != "no error":
+            self.error = error.copy()
+            return
         request_type = request.getType()
         if request_type == MegaRequest.TYPE_LOGIN:
             api.fetchNodes()
@@ -102,11 +103,20 @@ class MegaAppListener(MegaListener):
             LOGGER.error(e)
 
     def onTransferTemporaryError(self, api, transfer, error):
-        LOGGER.info(f'Mega download error in file {transfer} {transfer.getFileName()}: {error}')
-        self.error = error.toString()
+        filen = transfer.getFileName()
+        state = transfer.getState()
+        errStr = error.toString()
+        LOGGER.info(f'Mega download error in file {transfer} {filen}: {error}')
+
+        if state == 1 or state == 4:
+            # Sometimes MEGA (offical client) can't stream a node either and raises a temp failed error.
+            # Don't break the transfer queue if transfer's in queued (1) or retrying (4) state [causes seg fault]
+            return
+
+        self.error = errStr
         if not self.is_cancelled:
             self.is_cancelled = True
-            self.listener.onDownloadError("TransferTempError: " + self.error)
+            self.listener.onDownloadError(f"TransferTempError: {errStr} ({filen})")
 
     def cancel_download(self):
         self.is_cancelled = True
@@ -123,6 +133,7 @@ class AsyncExecutor:
         function(*args)
         self.continue_event.wait()
 
+listeners = []
 
 class MegaDownloadHelper:
     def __init__(self):
@@ -135,7 +146,9 @@ class MegaDownloadHelper:
             raise MegaDownloaderException('Mega API KEY not provided! Cannot mirror mega links')
         executor = AsyncExecutor()
         api = MegaApi(MEGA_API_KEY, None, None, 'telegram-mirror-bot')
+        global listeners
         mega_listener = MegaAppListener(executor.continue_event, listener)
+        listeners.append(mega_listener)
         with download_dict_lock:
             download_dict[listener.uid] = MegaDownloadStatus(mega_listener, listener)
         os.makedirs(path)
@@ -148,7 +161,7 @@ class MegaDownloadHelper:
             node = mega_listener.public_node
         else:
             LOGGER.info("Logging into mega folder")
-            folder_api = MegaApi(MEGA_API_KEY, None, None, 'TgBot')
+            folder_api = MegaApi(MEGA_API_KEY,None,None,'TgBot')
             folder_api.addListener(mega_listener)
             executor.do(folder_api.loginToFolder, (mega_link,))
             node = folder_api.authorizeNode(mega_listener.node)
@@ -156,4 +169,4 @@ class MegaDownloadHelper:
             return listener.onDownloadError(str(mega_listener.error))
         gid = ''.join(random.SystemRandom().choices(string.ascii_letters + string.digits, k=8))
         mega_listener.setValues(node.getName(), api.getSize(node), gid)
-        executor.do(api.startDownload, (node, path))
+        executor.do(api.startDownload,(node,path))
